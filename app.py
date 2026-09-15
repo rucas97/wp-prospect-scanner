@@ -1,311 +1,323 @@
-import csv
-import io
-from html import escape
-
 from fastapi import FastAPI, Form, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, Response
-
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-)
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
+from scanner import scan_site_async, scan_many
+from io import BytesIO
 from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
+import csv
+import re
 
-from scanner import scan_site, scan_many
+app = FastAPI(title="WP Prospect Scanner")
 
-app = FastAPI(title="WP Prospect Scanner", version="2.0")
 
-HOME = """
-<!DOCTYPE html>
+def esc(value):
+    if value is None:
+        return ""
+    s = str(value)
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+    )
+
+
+def findings_rows(findings):
+    rows = []
+    for item in findings or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            severity = item[0]
+            message = item[1]
+        elif isinstance(item, dict):
+            severity = item.get("severity", item.get("level", "Info"))
+            message = item.get("message", item.get("finding", ""))
+        else:
+            severity = "Info"
+            message = str(item)
+        rows.append((str(severity), str(message)))
+    return rows
+
+
+def render_report(result):
+    findings = findings_rows(result.get("findings", []))
+    rows_html = ""
+    for severity, message in findings:
+        rows_html += (
+            "<tr>"
+            f"<td><b>{esc(severity)}</b></td>"
+            f"<td>{esc(message)}</td>"
+            "</tr>"
+        )
+
+    if not rows_html:
+        rows_html = "<tr><td>Info</td><td>No actionable findings detected.</td></tr>"
+
+    return f"""<!doctype html>
 <html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>WP Prospect Scanner</title>
 <style>
-body{font-family:Arial,sans-serif;max-width:1100px;margin:30px auto;padding:20px;background:#f3f4f6}
-.card{background:white;padding:25px;margin-bottom:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,.05)}
-h1{margin-top:0}
-textarea{width:100%;min-height:180px;padding:12px;box-sizing:border-box;border:1px solid #ccc;border-radius:8px}
-button{background:#111827;color:white;border:0;padding:12px 20px;border-radius:7px;cursor:pointer;margin-top:10px}
-input[type=file]{margin-top:10px}
-small{color:#666}
-a.button{display:inline-block;background:#111827;color:white;padding:10px 14px;border-radius:7px;text-decoration:none;margin:5px 0}
+body{{font-family:Arial,sans-serif;max-width:1000px;margin:30px auto;padding:0 16px;color:#222}}
+h1{{margin-bottom:6px}}
+.card{{border:1px solid #ddd;border-radius:10px;padding:18px;margin:16px 0}}
+.score{{font-size:30px;font-weight:bold}}
+table{{width:100%;border-collapse:collapse}}
+th,td{{padding:10px;border:1px solid #ddd;text-align:left;vertical-align:top}}
+th{{background:#f5f5f5}}
+input[type=url],input[type=file]{{padding:10px;width:100%;box-sizing:border-box}}
+button{{padding:10px 16px;margin-top:8px;cursor:pointer}}
+.small{{color:#666;font-size:14px}}
+.error{{color:#b00020;font-weight:bold}}
 </style>
 </head>
 <body>
-<div class="card">
 <h1>WP Prospect Scanner</h1>
-<p>Passive WordPress, frontend, SEO, accessibility and technical prospect analysis.</p>
-<h3>Quick scan</h3>
-<form method="post" action="/scan">
-<textarea name="url" placeholder="https://example.com" required></textarea>
-<br><button type="submit">Scan Website</button>
-</form>
-</div>
 <div class="card">
-<h3>Batch scan</h3>
-<p>Upload a TXT or CSV file containing one website URL per line. Up to 50 URLs per batch.</p>
-<form method="post" action="/batch" enctype="multipart/form-data">
-<input type="file" name="file" accept=".txt,.csv" required>
-<br><button type="submit">Scan All Websites</button>
-</form>
+<div class="small">URL</div>
+<div><a href="{esc(result.get("url",""))}" target="_blank" rel="noopener">{esc(result.get("url",""))}</a></div>
+<p><b>Final URL:</b> {esc(result.get("final_url",""))}</p>
+<p><b>HTTP status:</b> {esc(result.get("status_code",""))}</p>
+<p><b>WordPress:</b> {"Yes" if result.get("wordpress") else "No / not confirmed"}</p>
+<p><b>WordPress version:</b> {esc(result.get("wp_version") or "Not detected")}</p>
+<p class="score">Lead score: {esc(result.get("lead_score",0))}</p>
 </div>
-</body>
-</html>
-"""
 
-
-def severity_order(value):
-    return {"High": 0, "Medium": 1, "Low": 2, "Info": 3}.get(value, 4)
-
-
-def report_html(result):
-    findings = sorted(
-        result.get("findings", []),
-        key=lambda x: severity_order(x["severity"])
-    )
-
-    rows = ""
-    for finding in findings:
-        rows += f"""
-        <tr>
-        <td><b>{escape(finding['severity'])}</b></td>
-        <td>{escape(finding['category'])}</td>
-        <td>{escape(finding['title'])}</td>
-        <td>{escape(finding['details'])}</td>
-        <td>{escape(finding['recommendation'])}</td>
-        </tr>
-        """
-
-    browser = result.get("browser", {})
-    layout = browser.get("layout", {})
-
-    return f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Website Audit - {escape(result.get('url',''))}</title>
-<style>
-body{{font-family:Arial,sans-serif;margin:40px;color:#222}}
-h1{{margin-bottom:5px}}
-.score{{font-size:32px;font-weight:bold}}
-table{{border-collapse:collapse;width:100%;margin-top:20px}}
-th,td{{border:1px solid #ddd;padding:8px;vertical-align:top;font-size:12px}}
-th{{background:#f0f0f0}}
-.meta{{margin:20px 0;padding:15px;background:#f5f5f5}}
-</style>
-</head>
-<body>
-<h1>Website Technical Audit</h1>
-<p><b>Website:</b> {escape(result.get('final_url', result.get('url','')))}</p>
-<div class="meta">
-<div class="score">Lead Score: {result.get('lead_score',0)}/100</div>
-<p><b>WordPress:</b> {'Confirmed' if result.get('wordpress') else 'Not confirmed'}</p>
-<p><b>WordPress version:</b> {escape(str(result.get('wp_version') or 'Not publicly detected'))}</p>
-<p><b>HTTP status:</b> {result.get('status_code','')}</p>
-</div>
-<h2>Technical Findings</h2>
+<div class="card">
+<h2>Findings</h2>
 <table>
-<tr><th>Severity</th><th>Category</th><th>Finding</th><th>Observation</th><th>Recommended action</th></tr>
-{rows}
+<thead><tr><th>Severity</th><th>Finding</th></tr></thead>
+<tbody>{rows_html}</tbody>
 </table>
-<h2>Technology</h2>
-<p><b>Themes:</b> {escape(', '.join(result.get('themes', [])) or 'Not detected')}</p>
-<p><b>Plugins:</b> {escape(', '.join(result.get('plugins', [])) or 'Not detected')}</p>
-<h2>Page Information</h2>
-<p><b>Title:</b> {escape(result.get('title',''))}</p>
-<p><b>Meta description:</b> {escape(result.get('description','')[:500])}</p>
-<p><b>H1 count:</b> {result.get('h1_count',0)}</p>
-<p><b>Images:</b> {result.get('image_count',0)}</p>
-<p><b>Images without ALT:</b> {result.get('missing_alt_count',0)}</p>
-<h2>Browser Testing</h2>
-<p><b>JavaScript runtime errors:</b> {len(browser.get('javascript_errors',[]))}</p>
-<p><b>Console errors:</b> {len(browser.get('console_errors',[]))}</p>
-<p><b>Failed resources:</b> {len(browser.get('failed_requests',[]))}</p>
-<p><b>Mobile horizontal overflow:</b> {layout.get('mobile',{}).get('horizontalOverflow',False)}</p>
-<p><b>Desktop horizontal overflow:</b> {layout.get('desktop',{}).get('horizontalOverflow',False)}</p>
-<p><b>DOM content load:</b> {browser.get('timing',{}).get('domcontentloaded_seconds','N/A')} seconds</p>
-<hr>
-<p>This report is based on publicly accessible website behaviour. Findings should be manually verified before making security, accessibility or business-critical claims.</p>
+</div>
+
+<div class="card">
+<h2>Page information</h2>
+<p><b>Title:</b> {esc(result.get("title",""))}</p>
+<p><b>Description:</b> {esc(result.get("description",""))}</p>
+<p><b>Canonical:</b> {esc(result.get("canonical",""))}</p>
+<p><b>H1 count:</b> {esc(result.get("h1_count",""))}</p>
+<p><b>Images:</b> {esc(result.get("image_count",""))}</p>
+<p><b>Images missing ALT:</b> {esc(result.get("missing_alt_count",""))}</p>
+<p><b>Missing security headers:</b> {esc(", ".join(result.get("missing_security_headers",[]) or []) or "None")}</p>
+</div>
+
+<div class="card">
+<h2>Browser checks</h2>
+<p><b>JavaScript errors:</b> {esc(len(result.get("js_errors",[]) or []))}</p>
+<p><b>Console errors:</b> {esc(len(result.get("console_errors",[]) or []))}</p>
+<p><b>Failed resources:</b> {esc(len(result.get("failed_requests",[]) or []))}</p>
+<p><b>Desktop horizontal overflow:</b> {esc(result.get("desktop_horizontal_overflow","Not tested"))}</p>
+<p><b>Mobile horizontal overflow:</b> {esc(result.get("mobile_horizontal_overflow","Not tested"))}</p>
+<p><b>DOMContentLoaded:</b> {esc(result.get("dom_content_loaded_ms",""))} ms</p>
+</div>
+
+<div class="card">
+<h2>WordPress indicators</h2>
+<p>{esc(", ".join(result.get("wp_indicators",[]) or []) or "None")}</p>
+</div>
+
+<div class="card">
+<h2>Special endpoints</h2>
+<pre>{esc(result.get("special_endpoints",{}))}</pre>
+</div>
+
+<div class="card">
+<a href="/report-html?url={esc(result.get("url",""))}">Refresh report</a>
+</div>
 </body>
-</html>
-"""
-
-
-def make_pdf(result):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4,
-        rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30
-    )
-    styles = getSampleStyleSheet()
-    story = [
-        Paragraph("Website Technical Audit", styles["Title"]),
-        Spacer(1, 12),
-        Paragraph(
-            f"<b>Website:</b> {escape(result.get('final_url', result.get('url','')))}",
-            styles["Normal"]
-        ),
-        Paragraph(
-            f"<b>Lead Score:</b> {result.get('lead_score',0)}/100",
-            styles["Heading2"]
-        ),
-        Paragraph(
-            f"<b>WordPress:</b> {'Confirmed' if result.get('wordpress') else 'Not confirmed'}",
-            styles["Normal"]
-        ),
-        Paragraph(
-            f"<b>Detected WP version:</b> {escape(str(result.get('wp_version') or 'Not publicly detected'))}",
-            styles["Normal"]
-        ),
-        Spacer(1, 15),
-    ]
-
-    data = [["Severity", "Category", "Finding"]]
-    findings = sorted(
-        result.get("findings", []),
-        key=lambda x: severity_order(x["severity"])
-    )
-
-    for finding in findings[:60]:
-        data.append([
-            finding["severity"],
-            finding["category"],
-            Paragraph(
-                f"<b>{escape(finding['title'])}</b><br/>"
-                f"{escape(finding['details'])}<br/>"
-                f"<i>Action: {escape(finding['recommendation'])}</i>",
-                styles["BodyText"]
-            )
-        ])
-
-    table = Table(data, colWidths=[55, 75, 390], repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.lightgrey),
-        ("GRID",(0,0),(-1,-1),0.5,colors.grey),
-        ("VALIGN",(0,0),(-1,-1),"TOP"),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-        ("FONTSIZE",(0,0),(-1,-1),8),
-        ("TOPPADDING",(0,0),(-1,-1),5),
-        ("BOTTOMPADDING",(0,0),(-1,-1),5),
-    ]))
-    story.append(table)
-    story.append(Spacer(1, 15))
-    story.append(Paragraph(
-        "This report is based on publicly accessible website behaviour. "
-        "Findings should be manually verified before making security or "
-        "business-critical claims.",
-        styles["Small"]
-    ))
-    doc.build(story)
-    return buffer.getvalue()
-
-
-def extract_urls(text):
-    urls = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.lower() in ("url", "website", "website_url"):
-            continue
-        if "," in line:
-            first = line.split(",")[0].strip()
-            if first.startswith(("http://", "https://")):
-                line = first
-        if not line.startswith(("http://", "https://")):
-            line = "https://" + line
-        urls.append(line)
-    return list(dict.fromkeys(urls))
+</html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HOME
+    return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WP Prospect Scanner</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:850px;margin:30px auto;padding:0 16px}
+.card{border:1px solid #ddd;border-radius:10px;padding:20px;margin:20px 0}
+input[type=url],input[type=file]{width:100%;box-sizing:border-box;padding:12px;margin:8px 0}
+button{padding:11px 18px;cursor:pointer}
+.small{color:#666}
+</style>
+</head>
+<body>
+<h1>WP Prospect Scanner</h1>
+<p class="small">Passive WordPress prospecting and website audit.</p>
+
+<div class="card">
+<h2>Quick scan</h2>
+<form method="post" action="/scan">
+<input type="url" name="url" placeholder="https://example.com" required>
+<button type="submit">Scan website</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Batch scan</h2>
+<form method="post" action="/batch" enctype="multipart/form-data">
+<input type="file" name="file" accept=".txt,.csv" required>
+<button type="submit">Scan list</button>
+</form>
+<p class="small">One URL per line, or a CSV containing URLs. Maximum 50 URLs.</p>
+</div>
+</body>
+</html>"""
 
 
-@app.post("/scan")
+@app.post("/scan", response_class=HTMLResponse)
 async def scan(url: str = Form(...)):
-    result = scan_site(url)
-    return HTMLResponse(report_html(result))
+    result = await scan_site_async(url)
+    return HTMLResponse(render_report(result))
 
 
-@app.post("/batch")
-async def batch(file: UploadFile = File(...)):
-    content = await file.read()
-    text = content.decode("utf-8", errors="ignore")
-    urls = extract_urls(text)
-
-    if not urls:
-        return JSONResponse(
-            {"error": "No URLs were found in the uploaded file."},
-            status_code=400
-        )
-
-    urls = urls[:50]
-    results = scan_many(urls)
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow([
-        "URL","Final URL","WordPress","WP Version","Lead Score",
-        "Findings","High","Medium","Low","JavaScript Errors",
-        "Console Errors","Failed Resources","Mobile Overflow",
-        "Desktop Overflow","Broken Links"
-    ])
-
-    for result in results:
-        findings = result.get("findings", [])
-        high = sum(1 for x in findings if x["severity"] == "High")
-        medium = sum(1 for x in findings if x["severity"] == "Medium")
-        low = sum(1 for x in findings if x["severity"] == "Low")
-        browser = result.get("browser", {})
-        layout = browser.get("layout", {})
-
-        writer.writerow([
-            result.get("url",""),
-            result.get("final_url",""),
-            result.get("wordpress",False),
-            result.get("wp_version",""),
-            result.get("lead_score",0),
-            len(findings),
-            high, medium, low,
-            len(browser.get("javascript_errors",[])),
-            len(browser.get("console_errors",[])),
-            len(browser.get("failed_requests",[])),
-            layout.get("mobile",{}).get("horizontalOverflow",False),
-            layout.get("desktop",{}).get("horizontalOverflow",False),
-            len(result.get("broken_links",[])),
-        ])
-
-    return Response(
-        content=output.getvalue().encode("utf-8"),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition":
-            'attachment; filename="wp-prospect-results.csv"'
-        }
-    )
+@app.get("/report-html", response_class=HTMLResponse)
+async def report_html(url: str):
+    result = await scan_site_async(url)
+    return HTMLResponse(render_report(result))
 
 
 @app.post("/report")
 async def report(url: str = Form(...)):
-    result = scan_site(url)
-    pdf = make_pdf(result)
-    return Response(
-        content=pdf,
+    result = await scan_site_async(url)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, rightMargin=36, leftMargin=36,
+                            topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("WordPress Prospect Scanner Report", styles["Title"]))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(f"URL: {esc(result.get('url',''))}", styles["BodyText"]))
+    story.append(Paragraph(f"Final URL: {esc(result.get('final_url',''))}", styles["BodyText"]))
+    story.append(Paragraph(f"HTTP status: {esc(result.get('status_code',''))}", styles["BodyText"]))
+    story.append(Paragraph(
+        f"WordPress: {'Yes' if result.get('wordpress') else 'No / not confirmed'}",
+        styles["BodyText"]
+    ))
+    story.append(Paragraph(
+        f"WordPress version: {esc(result.get('wp_version') or 'Not detected')}",
+        styles["BodyText"]
+    ))
+    story.append(Paragraph(
+        f"Lead score: {esc(result.get('lead_score',0))}",
+        styles["Heading2"]
+    ))
+    story.append(Spacer(1, 10))
+
+    data = [["Severity", "Finding"]]
+    for severity, message in findings_rows(result.get("findings", [])):
+        data.append([severity, message])
+    if len(data) == 1:
+        data.append(["Info", "No actionable findings detected."])
+
+    table = Table(data, colWidths=[80, 420])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+        ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 14))
+
+    info = [
+        ["Title", str(result.get("title",""))],
+        ["Description", str(result.get("description",""))],
+        ["Canonical", str(result.get("canonical",""))],
+        ["H1 count", str(result.get("h1_count",""))],
+        ["Images", str(result.get("image_count",""))],
+        ["Missing ALT", str(result.get("missing_alt_count",""))],
+        ["Missing security headers", ", ".join(result.get("missing_security_headers",[]) or [])],
+        ["JS errors", str(len(result.get("js_errors",[]) or []))],
+        ["Console errors", str(len(result.get("console_errors",[]) or []))],
+        ["Failed resources", str(len(result.get("failed_requests",[]) or []))],
+    ]
+    table2 = Table(info, colWidths=[160, 340])
+    table2.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
+    ]))
+    story.append(table2)
+
+    doc.build(story)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition":
-            'attachment; filename="website-audit.pdf"'
-        }
+        headers={"Content-Disposition": 'attachment; filename="website-audit.pdf"'}
     )
 
 
-@app.get("/report-html")
-async def report_html_endpoint(url: str):
-    result = scan_site(url)
-    return HTMLResponse(report_html(result))
+@app.post("/batch")
+async def batch(file: UploadFile = File(...)):
+    raw = await file.read()
+    text = raw.decode("utf-8-sig", errors="ignore")
+
+    urls = []
+    if file.filename and file.filename.lower().endswith(".csv"):
+        reader = csv.reader(text.splitlines())
+        for row in reader:
+            for cell in row:
+                cell = cell.strip()
+                if cell.startswith(("http://", "https://")):
+                    urls.append(cell)
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith(("http://", "https://")):
+                urls.append(line)
+
+    # Preserve order while removing duplicates.
+    seen = set()
+    urls = [u for u in urls if not (u in seen or seen.add(u))]
+    urls = urls[:50]
+
+    # IMPORTANT: run the async scanner directly; never call asyncio.run()
+    # from this already-running FastAPI event loop.
+    results = await scan_many(urls)
+
+    output = BytesIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "url", "final_url", "status_code", "wordpress", "wp_version",
+        "title", "missing_alt_count", "lead_score", "findings", "error"
+    ])
+
+    for r in results:
+        finding_text = " | ".join(
+            f"{severity}: {message}"
+            for severity, message in findings_rows(r.get("findings", []))
+        )
+        writer.writerow([
+            r.get("url",""),
+            r.get("final_url",""),
+            r.get("status_code",""),
+            r.get("wordpress",""),
+            r.get("wp_version",""),
+            r.get("title",""),
+            r.get("missing_alt_count",""),
+            r.get("lead_score",""),
+            finding_text,
+            r.get("error",""),
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="wp-prospect-results.csv"'}
+    )
